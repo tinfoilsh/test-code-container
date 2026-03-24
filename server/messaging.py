@@ -1,0 +1,443 @@
+import datetime
+import json
+import logging
+import uuid
+import asyncio
+
+from asyncio import Queue
+from typing import (
+    Dict,
+    Optional,
+    Union,
+)
+from pydantic import StrictStr
+from websockets.client import WebSocketClientProtocol, connect
+from websockets.exceptions import (
+    ConnectionClosedError,
+    WebSocketException,
+)
+
+from api.models.error import Error
+from api.models.logs import Stdout, Stderr
+from api.models.result import Result
+from api.models.output import (
+    EndOfExecution,
+    NumberOfExecutions,
+    OutputType,
+    UnexpectedEndOfExecution,
+)
+from errors import ExecutionError
+
+logger = logging.getLogger(__name__)
+
+MAX_RECONNECT_RETRIES = 3
+PING_TIMEOUT = 30
+
+
+class Execution:
+    def __init__(self, in_background: bool = False):
+        self.queue = Queue[
+            Union[
+                Result,
+                Error,
+                Stdout,
+                Stderr,
+                EndOfExecution,
+                NumberOfExecutions,
+                UnexpectedEndOfExecution,
+            ]
+        ]()
+        self.input_accepted = False
+        self.errored = False
+        self.in_background = in_background
+
+
+class ContextWebSocket:
+    _ws: Optional[WebSocketClientProtocol] = None
+    _receive_task: Optional[asyncio.Task] = None
+    _cleanup_task: Optional[asyncio.Task] = None
+
+    def __init__(self, context_id: str, session_id: str, language: str, cwd: str):
+        self.language = language
+        self.cwd = cwd
+        self.context_id = context_id
+        self.url = f"ws://localhost:8888/api/kernels/{context_id}/channels"
+        self.session_id = session_id
+        self._executions: Dict[str, Execution] = {}
+        self._lock = asyncio.Lock()
+
+    async def reconnect(self):
+        if self._ws is not None:
+            await self._ws.close(reason="Reconnecting")
+
+        if self._receive_task is not None:
+            await self._receive_task
+
+        await self.connect()
+
+    async def connect(self):
+        logger.debug(f"WebSocket connecting to {self.url}")
+
+        ws_logger = logger.getChild("websockets.client")
+        ws_logger.setLevel(logging.ERROR)
+
+        self._ws = await connect(
+            self.url,
+            ping_timeout=PING_TIMEOUT,
+            max_size=None,
+            max_queue=None,
+            logger=ws_logger,
+        )
+
+        logger.info(f"WebSocket connected to {self.url}")
+        self._receive_task = asyncio.create_task(
+            self._receive_message(),
+            name="receive_message",
+        )
+
+    def _get_execute_request(
+        self, msg_id: str, code: Union[str, StrictStr], background: bool
+    ) -> str:
+        return json.dumps(
+            {
+                "header": {
+                    "msg_id": msg_id,
+                    "username": "e2b",
+                    "session": self.session_id,
+                    "msg_type": "execute_request",
+                    "version": "5.3",
+                    "date": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                },
+                "parent_header": {},
+                "metadata": {
+                    "trusted": True,
+                    "deletedCells": [],
+                    "recordTiming": False,
+                    "cellId": str(uuid.uuid4()),
+                },
+                "content": {
+                    "code": code,
+                    "silent": background,
+                    "store_history": True,
+                    "user_expressions": {},
+                    "stop_on_error": True,
+                    "allow_stdin": False,
+                },
+            }
+        )
+
+    def _set_env_var_snippet(self, key: str, value: str) -> str:
+        if self.language == "python":
+            return f"import os; os.environ['{key}'] = '{value}'"
+        return ""
+
+    def _delete_env_var_snippet(self, key: str) -> str:
+        if self.language == "python":
+            return f"import os; del os.environ['{key}']"
+        return ""
+
+    def _set_env_vars_code(self, env_vars: Dict[StrictStr, str]) -> str:
+        env_commands = []
+        for k, v in env_vars.items():
+            command = self._set_env_var_snippet(k, v)
+            if command:
+                env_commands.append(command)
+        return "\n".join(env_commands)
+
+    def _reset_env_vars_code(self, env_vars: Dict[StrictStr, str]) -> str:
+        cleanup_commands = []
+        for key in env_vars:
+            command = self._delete_env_var_snippet(key)
+            if command:
+                cleanup_commands.append(command)
+        return "\n".join(cleanup_commands)
+
+    def _get_code_indentation(self, code: str) -> str:
+        if not code or not code.strip():
+            return ""
+        for line in code.split("\n"):
+            if line.strip():
+                return line[: len(line) - len(line.lstrip())]
+        return ""
+
+    def _indent_code_with_level(self, code: str, indent_level: str) -> str:
+        if not code or not indent_level:
+            return code
+        lines = code.split("\n")
+        indented_lines = []
+        for line in lines:
+            if line.strip():
+                indented_lines.append(indent_level + line)
+            else:
+                indented_lines.append(line)
+        return "\n".join(indented_lines)
+
+    async def _cleanup_env_vars(self, env_vars: Dict[StrictStr, str]):
+        message_id = str(uuid.uuid4())
+        self._executions[message_id] = Execution(in_background=True)
+
+        try:
+            cleanup_code = self._reset_env_vars_code(env_vars)
+            if cleanup_code:
+                logger.info(f"Cleaning up env vars: {cleanup_code}")
+                request = self._get_execute_request(message_id, cleanup_code, True)
+                await self._ws.send(request)
+
+                async for item in self._wait_for_result(message_id):
+                    if item["type"] == "error":
+                        logger.error(f"Error during env var cleanup: {item}")
+        finally:
+            del self._executions[message_id]
+
+    async def _wait_for_result(self, message_id: str):
+        queue = self._executions[message_id].queue
+
+        while True:
+            output = await queue.get()
+            if output.type == OutputType.END_OF_EXECUTION:
+                break
+
+            if output.type == OutputType.UNEXPECTED_END_OF_EXECUTION:
+                logger.error(f"Unexpected end of execution for code ({message_id})")
+                yield Error(
+                    name="UnexpectedEndOfExecution",
+                    value="Connection to the execution was closed before the execution was finished",
+                    traceback="",
+                )
+                break
+
+            yield output.model_dump(exclude_none=True)
+
+    async def change_current_directory(
+        self, path: Union[str, StrictStr], language: str
+    ):
+        message_id = str(uuid.uuid4())
+        self._executions[message_id] = Execution(in_background=True)
+        if language == "python":
+            request = self._get_execute_request(message_id, f"%cd {path}", True)
+        else:
+            return
+
+        await self._ws.send(request)
+
+        async for item in self._wait_for_result(message_id):
+            if item["type"] == "error":
+                raise ExecutionError(f"Error during execution: {item}")
+
+    async def execute(
+        self,
+        code: Union[str, StrictStr],
+        env_vars: Dict[StrictStr, str],
+    ):
+        if self._ws is None:
+            raise Exception("WebSocket not connected")
+
+        async with self._lock:
+            if self._cleanup_task and not self._cleanup_task.done():
+                logger.debug("Waiting for pending cleanup task to complete")
+                try:
+                    await self._cleanup_task
+                except Exception as e:
+                    logger.warning(f"Cleanup task failed: {e}")
+                finally:
+                    self._cleanup_task = None
+
+            code_indent = self._get_code_indentation(code)
+            complete_code = code
+
+            if env_vars:
+                env_vars_snippet = self._set_env_vars_code(env_vars)
+                indented_env_code = self._indent_code_with_level(env_vars_snippet, code_indent)
+                complete_code = f"{indented_env_code}\n{complete_code}"
+
+            message_id = str(uuid.uuid4())
+            execution = Execution()
+            self._executions[message_id] = execution
+
+            for i in range(1 + MAX_RECONNECT_RETRIES):
+                try:
+                    logger.info(
+                        f"Sending code for the execution ({message_id}): {complete_code}"
+                    )
+                    request = self._get_execute_request(
+                        message_id, complete_code, False
+                    )
+                    await self._ws.send(request)
+                    break
+                except (ConnectionClosedError, WebSocketException) as e:
+                    if i < MAX_RECONNECT_RETRIES:
+                        logger.warning(
+                            f"WebSocket connection lost while sending execution request, {i + 1}. reconnecting...: {str(e)}"
+                        )
+                        await self.reconnect()
+            else:
+                logger.error("Failed to send execution request")
+                await execution.queue.put(
+                    Error(
+                        name="WebSocketError",
+                        value="Failed to send execution request",
+                        traceback="",
+                    )
+                )
+                await execution.queue.put(UnexpectedEndOfExecution())
+
+            async for item in self._wait_for_result(message_id):
+                yield item
+
+            del self._executions[message_id]
+
+            if env_vars:
+                self._cleanup_task = asyncio.create_task(
+                    self._cleanup_env_vars(env_vars)
+                )
+
+    async def _receive_message(self):
+        if not self._ws:
+            logger.error("No WebSocket connection")
+            return
+
+        try:
+            async for message in self._ws:
+                await self._process_message(json.loads(message))
+        except Exception as e:
+            logger.error(f"WebSocket received error while receiving messages: {str(e)}")
+        finally:
+            for key, execution in self._executions.items():
+                await execution.queue.put(
+                    Error(
+                        name="WebSocketError",
+                        value="The connections was lost, rerun the code to get the results",
+                        traceback="",
+                    )
+                )
+                await execution.queue.put(UnexpectedEndOfExecution())
+
+    async def _process_message(self, data: dict):
+        if (
+            data["msg_type"] == "status"
+            and data["content"]["execution_state"] == "restarting"
+        ):
+            logger.error("Context is restarting")
+            for execution in self._executions.values():
+                await execution.queue.put(
+                    Error(
+                        name="ContextRestarting",
+                        value="Context was restarted",
+                        traceback="",
+                    )
+                )
+                await execution.queue.put(EndOfExecution())
+            return
+
+        parent_msg_ig = data["parent_header"].get("msg_id", None)
+        if parent_msg_ig is None:
+            logger.warning("Parent message ID not found. %s", data)
+            return
+
+        execution = self._executions.get(parent_msg_ig)
+        if not execution:
+            return
+
+        queue = execution.queue
+        if data["msg_type"] == "error":
+            if execution.errored:
+                return
+            execution.errored = True
+            await queue.put(
+                Error(
+                    name=data["content"]["ename"],
+                    value=data["content"]["evalue"],
+                    traceback="".join(data["content"]["traceback"]),
+                )
+            )
+
+        elif data["msg_type"] == "stream":
+            if data["content"]["name"] == "stdout":
+                await queue.put(
+                    Stdout(
+                        text=data["content"]["text"], timestamp=data["header"]["date"]
+                    )
+                )
+            elif data["content"]["name"] == "stderr":
+                await queue.put(
+                    Stderr(
+                        text=data["content"]["text"], timestamp=data["header"]["date"]
+                    )
+                )
+
+        elif data["msg_type"] in "display_data":
+            result = Result(is_main_result=False, data=data["content"]["data"])
+            await queue.put(result)
+
+        elif data["msg_type"] == "execute_result":
+            result = Result(is_main_result=True, data=data["content"]["data"])
+            await queue.put(result)
+
+        elif data["msg_type"] == "status":
+            if data["content"]["execution_state"] == "busy" and execution.in_background:
+                execution.input_accepted = True
+
+            if data["content"]["execution_state"] == "idle":
+                if execution.input_accepted:
+                    await queue.put(EndOfExecution())
+
+            elif data["content"]["execution_state"] == "error":
+                await queue.put(
+                    Error(
+                        name=data["content"]["ename"],
+                        value=data["content"]["evalue"],
+                        traceback="".join(data["content"]["traceback"]),
+                    )
+                )
+                await queue.put(EndOfExecution())
+
+        elif data["msg_type"] == "execute_reply":
+            if data["content"]["status"] == "error":
+                if execution.errored:
+                    return
+                execution.errored = True
+                await queue.put(
+                    Error(
+                        name=data["content"].get("ename", ""),
+                        value=data["content"].get("evalue", ""),
+                        traceback="".join(data["content"].get("traceback", [])),
+                    )
+                )
+            elif data["content"]["status"] == "abort":
+                await queue.put(
+                    Error(
+                        name="ExecutionAborted",
+                        value="Execution was aborted",
+                        traceback="",
+                    )
+                )
+                await queue.put(EndOfExecution())
+            elif data["content"]["status"] == "ok":
+                pass
+
+        elif data["msg_type"] == "execute_input":
+            await queue.put(
+                NumberOfExecutions(execution_count=data["content"]["execution_count"])
+            )
+            execution.input_accepted = True
+        else:
+            logger.warning(f"[UNHANDLED MESSAGE TYPE]: {data['msg_type']}")
+
+    async def close(self):
+        logger.debug(f"Closing WebSocket {self.context_id}")
+
+        if self._ws is not None:
+            await self._ws.close()
+
+        if self._receive_task is not None:
+            self._receive_task.cancel()
+
+        if self._cleanup_task and not self._cleanup_task.done():
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+
+        for execution in self._executions.values():
+            execution.queue.put_nowait(UnexpectedEndOfExecution())
