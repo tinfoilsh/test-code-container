@@ -180,13 +180,86 @@ Shut down and remove a context.
 
 ---
 
+## File API
+
+All paths are workspace-relative POSIX paths rooted at `/home/user`. Path traversal outside the workspace is rejected with `400`.
+
+### `GET /files`
+
+List directory contents. Defaults to the workspace root.
+
+| Query param | Default | Description |
+|---|---|---|
+| `path` | `.` | Workspace-relative directory path |
+
+**Response:**
+
+```json
+{
+  "path": ".",
+  "entries": [
+    {"name": "output.csv", "type": "file", "size": 1024, "modified": 1700000000.0},
+    {"name": "plots",       "type": "dir",  "size": null, "modified": 1700000000.0}
+  ]
+}
+```
+
+Directories are listed before files.
+
+**Errors:** `400` if path is a file, `404` if path does not exist.
+
+---
+
+### `GET /files/{path}`
+
+Download a file. Returns raw bytes with a detected `Content-Type` header.
+
+**Errors:** `404` if not found, `400` if path is a directory.
+
+```bash
+curl http://localhost:49999/files/output.csv
+curl http://localhost:49999/files/plots/chart.png --output chart.png
+```
+
+---
+
+### `PUT /files/{path}`
+
+Create or overwrite a file. Send raw bytes as the request body. Parent directories are created automatically.
+
+**Response:** `201` if created, `200` if overwritten.
+
+```bash
+curl -X PUT http://localhost:49999/files/input.txt \
+  -H "Content-Type: text/plain" \
+  --data-binary "hello world"
+
+curl -X PUT http://localhost:49999/files/data/input.csv \
+  --data-binary @local_file.csv
+```
+
+---
+
+### `DELETE /files/{path}`
+
+Delete a file or directory. Directory deletion is recursive.
+
+**Response:** `204` on success, `404` if not found.
+
+```bash
+curl -X DELETE http://localhost:49999/files/output.csv
+curl -X DELETE http://localhost:49999/files/plots   # removes directory and contents
+```
+
+---
+
 ## Tests
 
 Tests are integration tests — they require the container to be running on `localhost:49999`.
 
 ```bash
 pip install pytest requests
-pytest tests/test_api.py -v
+pytest tests/ -v
 ```
 
-The suite covers: health, stdout/stderr, expression results, rich output (matplotlib PNG), syntax and runtime errors, state persistence across calls, env var injection and cleanup, context creation/isolation/deletion/restart, and error handling (404, 400).
+The suite covers: health, stdout/stderr, expression results, rich output (matplotlib PNG), syntax and runtime errors, state persistence across calls, env var injection and cleanup, context creation/isolation/deletion/restart, file CRUD (create, download, list, delete, binary roundtrip, path traversal rejection), bidirectional kernel↔API file access, and error handling (404, 400).
