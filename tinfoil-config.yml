@@ -14,4 +14,4 @@ shim:
 
 containers:
   - name: "code-interpreter"
-    image: "ghcr.io/tinfoilsh/code-interpreter:0.0.5"
+    image: "ghcr.io/tinfoilsh/code-interpreter:0.0.1"
