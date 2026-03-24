@@ -3,7 +3,7 @@ name: Docker Build and Publish
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
 
 jobs:
   docker-build:
@@ -57,7 +57,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      - uses: tinfoilsh/measure-image-action@9733d724326dd6b476335ec513210861894d4cb2  # v0.8.2
+      - uses: tinfoilsh/pri-build-action@v0.6.0
         with:
           config-file: ${{ github.workspace }}/tinfoil-config.yml
           github-token: ${{ secrets.GITHUB_TOKEN }}
+          prerelease: "true"
