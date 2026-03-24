@@ -1,12 +1,25 @@
 import logging
+import mimetypes
+import shutil
 import sys
 import httpx
 
-from typing import Dict, Union, Literal, List
+from pathlib import Path
+from typing import Dict, Union, Literal, List, Optional
 
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
-from fastapi.responses import PlainTextResponse
+from fastapi import FastAPI, Query, Request
+from fastapi.responses import PlainTextResponse, FileResponse, JSONResponse
+
+WORKSPACE = Path("/home/user")
+
+
+def resolve(path: str) -> Path:
+    """Resolve a workspace-relative POSIX path, rejecting traversal outside WORKSPACE."""
+    resolved = (WORKSPACE / path).resolve()
+    if not str(resolved).startswith(str(WORKSPACE)):
+        raise ValueError(f"Path outside workspace: {path}")
+    return resolved
 
 from api.models.context import Context
 from api.models.create_context import CreateContext
@@ -200,3 +213,78 @@ async def remove_context(context_id: str) -> None:
         )
 
     del websockets[context_id]
+
+
+# ---------------------------------------------------------------------------
+# Files
+# ---------------------------------------------------------------------------
+
+@app.get("/files")
+async def list_files(path: Optional[str] = Query(default=".")):
+    try:
+        target = resolve(path)
+    except ValueError as e:
+        return PlainTextResponse(str(e), status_code=400)
+
+    if not target.exists():
+        return PlainTextResponse(f"Not found: {path}", status_code=404)
+    if not target.is_dir():
+        return PlainTextResponse(f"Not a directory: {path}", status_code=400)
+
+    entries = [
+        {
+            "name": entry.name,
+            "type": "dir" if entry.is_dir() else "file",
+            "size": entry.stat().st_size if entry.is_file() else None,
+            "modified": entry.stat().st_mtime,
+        }
+        for entry in sorted(target.iterdir(), key=lambda e: (e.is_file(), e.name))
+    ]
+    return JSONResponse({"path": path, "entries": entries})
+
+
+@app.get("/files/{path:path}")
+async def download_file(path: str):
+    try:
+        target = resolve(path)
+    except ValueError as e:
+        return PlainTextResponse(str(e), status_code=400)
+
+    if not target.exists():
+        return PlainTextResponse(f"Not found: {path}", status_code=404)
+    if target.is_dir():
+        return PlainTextResponse(f"Is a directory: {path}", status_code=400)
+
+    media_type, _ = mimetypes.guess_type(target.name)
+    return FileResponse(target, media_type=media_type or "application/octet-stream")
+
+
+@app.put("/files/{path:path}")
+async def upload_file(path: str, request: Request):
+    try:
+        target = resolve(path)
+    except ValueError as e:
+        return PlainTextResponse(str(e), status_code=400)
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    created = not target.exists()
+    target.write_bytes(await request.body())
+    return PlainTextResponse("", status_code=201 if created else 200)
+
+
+@app.delete("/files/{path:path}")
+async def delete_file(path: str):
+    try:
+        target = resolve(path)
+    except ValueError as e:
+        return PlainTextResponse(str(e), status_code=400)
+
+    if not target.exists():
+        return PlainTextResponse(f"Not found: {path}", status_code=404)
+
+    if target.is_dir():
+        shutil.rmtree(target)
+    else:
+        target.unlink()
+
+    return PlainTextResponse("", status_code=204)
