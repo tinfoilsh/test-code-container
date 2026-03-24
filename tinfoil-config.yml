@@ -14,4 +14,4 @@ shim:
 
 containers:
   - name: "test-code-container"
-    image: "ghcr.io/tinfoilsh/test-code-container:0.0.3"
+    image: "ghcr.io/tinfoilsh/test-code-container:0.0.4"
