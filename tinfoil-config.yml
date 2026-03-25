@@ -14,4 +14,6 @@ shim:
 
 containers:
   - name: "test-code-container"
-    image: "ghcr.io/tinfoilsh/test-code-container:0.0.4"
+    image: "ghcr.io/tinfoilsh/test-code-container:0.0.5"
+    secrets:
+      - API_KEY

@@ -1,5 +1,7 @@
 import logging
 import mimetypes
+import os
+import secrets
 import shutil
 import sys
 import httpx
@@ -8,10 +10,19 @@ from pathlib import Path
 from typing import Dict, Union, Literal, List, Optional
 
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Security
 from fastapi.responses import PlainTextResponse, FileResponse, JSONResponse
+from fastapi.security import APIKeyHeader
 
 WORKSPACE = Path("/home/user")
+
+API_KEY = os.environ["API_KEY"]
+_api_key_header = APIKeyHeader(name="X-API-Key")
+
+
+async def verify_api_key(api_key: str = Security(_api_key_header)):
+    if not secrets.compare_digest(api_key, API_KEY):
+        raise HTTPException(status_code=401, detail="Invalid API key")
 
 
 def resolve(path: str) -> Path:
@@ -75,7 +86,7 @@ async def get_health():
     return "OK"
 
 
-@app.post("/execute")
+@app.post("/execute", dependencies=[Depends(verify_api_key)])
 async def post_execute(exec_request: ExecutionRequest):
     logger.info(f"Executing code: {exec_request.code}")
 
@@ -125,7 +136,7 @@ async def post_execute(exec_request: ExecutionRequest):
     )
 
 
-@app.post("/contexts")
+@app.post("/contexts", dependencies=[Depends(verify_api_key)])
 async def post_contexts(request: CreateContext) -> Context:
     logger.info("Creating a new context")
 
@@ -138,7 +149,7 @@ async def post_contexts(request: CreateContext) -> Context:
         return PlainTextResponse(str(e), status_code=500)
 
 
-@app.get("/contexts")
+@app.get("/contexts", dependencies=[Depends(verify_api_key)])
 async def get_contexts() -> List[Context]:
     logger.info("Listing contexts")
 
@@ -153,7 +164,7 @@ async def get_contexts() -> List[Context]:
     ]
 
 
-@app.post("/contexts/{context_id}/restart")
+@app.post("/contexts/{context_id}/restart", dependencies=[Depends(verify_api_key)])
 async def restart_context(context_id: str) -> None:
     logger.info(f"Restarting context {context_id}")
 
@@ -189,7 +200,7 @@ async def restart_context(context_id: str) -> None:
     websockets[context_id] = ws
 
 
-@app.delete("/contexts/{context_id}")
+@app.delete("/contexts/{context_id}", dependencies=[Depends(verify_api_key)])
 async def remove_context(context_id: str) -> None:
     logger.info(f"Removing context {context_id}")
 
@@ -219,7 +230,7 @@ async def remove_context(context_id: str) -> None:
 # Files
 # ---------------------------------------------------------------------------
 
-@app.get("/files")
+@app.get("/files", dependencies=[Depends(verify_api_key)])
 async def list_files(path: Optional[str] = Query(default=".")):
     try:
         target = resolve(path)
@@ -243,7 +254,7 @@ async def list_files(path: Optional[str] = Query(default=".")):
     return JSONResponse({"path": path, "entries": entries})
 
 
-@app.get("/files/{path:path}")
+@app.get("/files/{path:path}", dependencies=[Depends(verify_api_key)])
 async def download_file(path: str):
     try:
         target = resolve(path)
@@ -259,7 +270,7 @@ async def download_file(path: str):
     return FileResponse(target, media_type=media_type or "application/octet-stream")
 
 
-@app.put("/files/{path:path}")
+@app.put("/files/{path:path}", dependencies=[Depends(verify_api_key)])
 async def upload_file(path: str, request: Request):
     try:
         target = resolve(path)
@@ -272,7 +283,7 @@ async def upload_file(path: str, request: Request):
     return PlainTextResponse("", status_code=201 if created else 200)
 
 
-@app.delete("/files/{path:path}")
+@app.delete("/files/{path:path}", dependencies=[Depends(verify_api_key)])
 async def delete_file(path: str):
     try:
         target = resolve(path)
