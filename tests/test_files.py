@@ -2,11 +2,14 @@
 Integration tests for the file API.
 Requires the container to be running on localhost:49999.
 """
+import os
 import time
 import pytest
 import requests
 
 BASE = "http://localhost:49999"
+API_KEY = os.environ.get("API_KEY", "test")
+HEADERS = {"X-API-Key": API_KEY}
 
 
 def wait_for_server(timeout=30):
@@ -22,19 +25,19 @@ def wait_for_server(timeout=30):
 
 
 def put(path, data=b""):
-    return requests.put(f"{BASE}/files/{path}", data=data)
+    return requests.put(f"{BASE}/files/{path}", data=data, headers=HEADERS)
 
 def get(path):
-    return requests.get(f"{BASE}/files/{path}")
+    return requests.get(f"{BASE}/files/{path}", headers=HEADERS)
 
 def delete(path):
-    return requests.delete(f"{BASE}/files/{path}")
+    return requests.delete(f"{BASE}/files/{path}", headers=HEADERS)
 
 def ls(path=None):
     url = f"{BASE}/files"
     if path:
         url += f"?path={path}"
-    return requests.get(url)
+    return requests.get(url, headers=HEADERS)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -301,7 +304,7 @@ def test_traversal_via_dotdot():
 
 def test_traversal_via_absolute_path():
     # FastAPI strips leading slash in path params, but verify safe outcome
-    r = requests.get(f"{BASE}/files//etc/passwd")
+    r = requests.get(f"{BASE}/files//etc/passwd", headers=HEADERS)
     assert r.status_code in (400, 404)
 
 
@@ -312,12 +315,12 @@ def test_traversal_via_absolute_path():
 def test_kernel_write_text_file():
     requests.post(f"{BASE}/execute",
         json={"code": "open('/home/user/out.txt','w').write('from kernel')"},
-        stream=True).content
+        stream=True, headers=HEADERS).content
     assert get("out.txt").content == b"from kernel"
 
 def test_kernel_write_csv():
     code = "import csv\nwith open('/home/user/data.csv','w') as f:\n    csv.writer(f).writerows([[1,2],[3,4]])\n"
-    requests.post(f"{BASE}/execute", json={"code": code}, stream=True).content
+    requests.post(f"{BASE}/execute", json={"code": code}, stream=True, headers=HEADERS).content
     r = get("data.csv")
     assert r.status_code == 200
     assert b"1,2" in r.content
@@ -328,7 +331,7 @@ def test_kernel_savefig_png():
         "fig,ax=plt.subplots()\nax.plot([1,2,3])\n"
         "fig.savefig('/home/user/chart.png')\n"
     )
-    requests.post(f"{BASE}/execute", json={"code": code}, stream=True).content
+    requests.post(f"{BASE}/execute", json={"code": code}, stream=True, headers=HEADERS).content
     r = get("chart.png")
     assert r.status_code == 200
     assert r.content[:8] == b"\x89PNG\r\n\x1a\n"
@@ -337,7 +340,7 @@ def test_api_write_kernel_reads():
     put("input.txt", b"hello from api")
     code = "print(open('/home/user/input.txt').read())"
     items = []
-    r = requests.post(f"{BASE}/execute", json={"code": code}, stream=True)
+    r = requests.post(f"{BASE}/execute", json={"code": code}, stream=True, headers=HEADERS)
     import json
     for line in r.iter_lines():
         if line:
