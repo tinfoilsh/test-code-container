@@ -6,11 +6,14 @@ Requires the container to be running on localhost:49999.
     pytest tests/test_api.py -v
 """
 import json
+import os
 import time
 import pytest
 import requests
 
 BASE = "http://localhost:49999"
+API_KEY = os.environ.get("API_KEY", "test")
+HEADERS = {"X-API-Key": API_KEY}
 
 
 def wait_for_server(timeout=30):
@@ -29,7 +32,7 @@ def wait_for_server(timeout=30):
 def execute(code, **kwargs):
     """POST /execute and return the list of streamed objects."""
     payload = {"code": code, **kwargs}
-    r = requests.post(f"{BASE}/execute", json=payload, stream=True, timeout=30)
+    r = requests.post(f"{BASE}/execute", json=payload, stream=True, timeout=30, headers=HEADERS)
     r.raise_for_status()
     return [json.loads(line) for line in r.iter_lines() if line]
 
@@ -153,7 +156,7 @@ def test_env_vars_cleaned_up():
 # ---------------------------------------------------------------------------
 
 def test_list_contexts():
-    r = requests.get(f"{BASE}/contexts")
+    r = requests.get(f"{BASE}/contexts", headers=HEADERS)
     assert r.status_code == 200
     contexts = r.json()
     assert isinstance(contexts, list)
@@ -162,7 +165,7 @@ def test_list_contexts():
 
 
 def test_create_and_use_context():
-    r = requests.post(f"{BASE}/contexts", json={"language": "python", "cwd": "/tmp"})
+    r = requests.post(f"{BASE}/contexts", json={"language": "python", "cwd": "/tmp"}, headers=HEADERS)
     assert r.status_code == 200
     ctx = r.json()
     assert ctx["language"] == "python"
@@ -176,8 +179,8 @@ def test_create_and_use_context():
 
 
 def test_context_isolation():
-    r1 = requests.post(f"{BASE}/contexts", json={"language": "python"})
-    r2 = requests.post(f"{BASE}/contexts", json={"language": "python"})
+    r1 = requests.post(f"{BASE}/contexts", json={"language": "python"}, headers=HEADERS)
+    r2 = requests.post(f"{BASE}/contexts", json={"language": "python"}, headers=HEADERS)
     ctx1, ctx2 = r1.json()["id"], r2.json()["id"]
 
     execute("val = 'ctx1'", context_id=ctx1)
@@ -193,22 +196,22 @@ def test_context_isolation():
 
 
 def test_delete_context():
-    r = requests.post(f"{BASE}/contexts", json={"language": "python"})
+    r = requests.post(f"{BASE}/contexts", json={"language": "python"}, headers=HEADERS)
     ctx_id = r.json()["id"]
 
-    del_r = requests.delete(f"{BASE}/contexts/{ctx_id}")
+    del_r = requests.delete(f"{BASE}/contexts/{ctx_id}", headers=HEADERS)
     assert del_r.status_code == 200
 
-    contexts = requests.get(f"{BASE}/contexts").json()
+    contexts = requests.get(f"{BASE}/contexts", headers=HEADERS).json()
     assert not any(c["id"] == ctx_id for c in contexts)
 
 
 def test_restart_context():
-    r = requests.post(f"{BASE}/contexts", json={"language": "python"})
+    r = requests.post(f"{BASE}/contexts", json={"language": "python"}, headers=HEADERS)
     ctx_id = r.json()["id"]
 
     execute("x = 99", context_id=ctx_id)
-    requests.post(f"{BASE}/contexts/{ctx_id}/restart")
+    requests.post(f"{BASE}/contexts/{ctx_id}/restart", headers=HEADERS)
     time.sleep(1)  # let kernel come back up
 
     items = execute("print(x)", context_id=ctx_id)
@@ -221,6 +224,7 @@ def test_missing_context():
         f"{BASE}/execute",
         json={"code": "print(1)", "context_id": "does-not-exist"},
         stream=True,
+        headers=HEADERS,
     )
     assert r.status_code == 404
 
@@ -230,6 +234,7 @@ def test_context_id_and_language_mutually_exclusive():
         f"{BASE}/execute",
         json={"code": "1", "context_id": "x", "language": "python"},
         stream=True,
+        headers=HEADERS,
     )
     assert r.status_code == 400
 
