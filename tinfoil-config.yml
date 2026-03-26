@@ -8,12 +8,11 @@ shim:
   upstream-port: 49999
   paths:
     - /health
+    - /claim
     - /execute
     - /contexts
     - /files
 
 containers:
   - name: "test-code-container"
-    image: "ghcr.io/tinfoilsh/test-code-container:0.0.5"
-    secrets:
-      - API_KEY
+    image: "ghcr.io/tinfoilsh/test-code-container:0.0.6"
