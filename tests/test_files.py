@@ -2,26 +2,11 @@
 Integration tests for the file API.
 Requires the container to be running on localhost:49999.
 """
-import os
-import time
 import pytest
 import requests
 
 BASE = "http://localhost:49999"
-API_KEY = os.environ.get("API_KEY", "test")
-HEADERS = {"X-API-Key": API_KEY}
-
-
-def wait_for_server(timeout=30):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            if requests.get(f"{BASE}/health", timeout=2).status_code == 200:
-                return
-        except requests.exceptions.ConnectionError:
-            pass
-        time.sleep(0.5)
-    raise RuntimeError("Server did not become healthy in time")
+HEADERS = {}
 
 
 def put(path, data=b""):
@@ -41,8 +26,8 @@ def ls(path=None):
 
 
 @pytest.fixture(scope="session", autouse=True)
-def server_ready():
-    wait_for_server()
+def server_ready(auth_headers):
+    HEADERS.update(auth_headers)
 
 
 # ---------------------------------------------------------------------------

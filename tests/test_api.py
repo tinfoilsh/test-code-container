@@ -6,27 +6,12 @@ Requires the container to be running on localhost:49999.
     pytest tests/test_api.py -v
 """
 import json
-import os
 import time
 import pytest
 import requests
 
 BASE = "http://localhost:49999"
-API_KEY = os.environ.get("API_KEY", "test")
-HEADERS = {"X-API-Key": API_KEY}
-
-
-def wait_for_server(timeout=30):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            r = requests.get(f"{BASE}/health", timeout=2)
-            if r.status_code == 200:
-                return
-        except requests.exceptions.ConnectionError:
-            pass
-        time.sleep(0.5)
-    raise RuntimeError("Server did not become healthy in time")
+HEADERS = {}
 
 
 def execute(code, **kwargs):
@@ -38,8 +23,8 @@ def execute(code, **kwargs):
 
 
 @pytest.fixture(scope="session", autouse=True)
-def server_ready():
-    wait_for_server()
+def server_ready(auth_headers):
+    HEADERS.update(auth_headers)
 
 
 # ---------------------------------------------------------------------------
